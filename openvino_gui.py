@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 try:
-    from PySide6.QtCore import QObject, QThread, Signal
+    from PySide6.QtCore import QObject, Qt, QThread, Signal
     from PySide6.QtGui import QFont, QTextCursor
     from PySide6.QtWidgets import (
         QApplication,
@@ -265,6 +265,8 @@ class MainWindow(QMainWindow):
         self._active_backend_type: Optional[str] = None  # "openvino" | "gguf"
         self._server_ready = False
         self.api_server: Optional[ApiServer] = None
+        self.log_window: Optional[QMainWindow] = None
+        self._log_window_text_edit: Optional[QPlainTextEdit] = None
 
         self.setWindowTitle("AI Playground - Local LLM Console")
         self.resize(900, 650)
@@ -398,6 +400,14 @@ class MainWindow(QMainWindow):
         gen_layout.addStretch(1)
         root.addWidget(gen_box)
 
+        console_header_row = QHBoxLayout()
+        console_header_row.addWidget(QLabel("Console:"))
+        console_header_row.addStretch(1)
+        self.log_window_button = QPushButton("Open Log Window")
+        self.log_window_button.clicked.connect(self._show_log_window)
+        console_header_row.addWidget(self.log_window_button)
+        root.addLayout(console_header_row)
+
         self.console = QPlainTextEdit()
         self.console.setReadOnly(True)
         self.console.setFont(QFont("Consolas", 9))
@@ -427,8 +437,48 @@ class MainWindow(QMainWindow):
         # console, no matter which worker thread produced it.
         self.log_stream = QtLogStream()
         self.log_stream.text_written.connect(self._append_console)
+        # Connected once, for the lifetime of the app; _append_log_window is a
+        # no-op whenever the on-demand log window isn't currently open.
+        self.log_stream.text_written.connect(self._append_log_window)
         sys.stdout = self.log_stream
         sys.stderr = self.log_stream
+
+    def _show_log_window(self) -> None:
+        if self.log_window is not None:
+            self.log_window.show()
+            self.log_window.raise_()
+            self.log_window.activateWindow()
+            return
+
+        self.log_window = QMainWindow(self)
+        self.log_window.setWindowTitle("AI Playground - Log")
+        self.log_window.resize(800, 500)
+        self.log_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.log_window.destroyed.connect(self._on_log_window_closed)
+
+        text_edit = QPlainTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setFont(QFont("Consolas", 9))
+        text_edit.setMaximumBlockCount(50000)
+        text_edit.setPlainText(self.console.toPlainText())  # catch up on history
+        text_edit.moveCursor(QTextCursor.MoveOperation.End)
+        self.log_window.setCentralWidget(text_edit)
+        self._log_window_text_edit = text_edit
+
+        self.log_window.show()
+
+    def _append_log_window(self, text: str) -> None:
+        if self._log_window_text_edit is None:
+            return
+        cursor = self._log_window_text_edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(text)
+        self._log_window_text_edit.setTextCursor(cursor)
+        self._log_window_text_edit.ensureCursorVisible()
+
+    def _on_log_window_closed(self) -> None:
+        self.log_window = None
+        self._log_window_text_edit = None
 
     # ---- helpers ---------------------------------------------------------
     def _append_console(self, text: str) -> None:
