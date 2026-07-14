@@ -39,6 +39,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Optional
 
@@ -330,6 +331,9 @@ class MainWindow(QMainWindow):
         self.api_server: Optional[ApiServer] = None
         self.log_window: Optional[QMainWindow] = None
         self._log_window_text_edit: Optional[QPlainTextEdit] = None
+        # Unfiltered history for the log window's catch-up-on-open, since the
+        # main console (self.console) now drops [ovms]/[llama] lines.
+        self._full_log_history: deque[str] = deque(maxlen=5000)
         self.python_window: Optional[QMainWindow] = None
         self._python_code_edit: Optional[QPlainTextEdit] = None
         self._python_output_edit: Optional[QPlainTextEdit] = None
@@ -533,7 +537,7 @@ class MainWindow(QMainWindow):
         text_edit.setReadOnly(True)
         text_edit.setFont(QFont("Consolas", 9))
         text_edit.setMaximumBlockCount(50000)
-        text_edit.setPlainText(self.console.toPlainText())  # catch up on history
+        text_edit.setPlainText("".join(self._full_log_history))  # catch up on history
         text_edit.moveCursor(QTextCursor.MoveOperation.End)
         self.log_window.setCentralWidget(text_edit)
         self._log_window_text_edit = text_edit
@@ -669,6 +673,20 @@ class MainWindow(QMainWindow):
 
     # ---- helpers ---------------------------------------------------------
     def _append_console(self, text: str) -> None:
+        # Single point every piece of console text passes through, whether
+        # from the stdout redirect or a direct call (e.g. the "> prompt"
+        # echo) -- so it's the one place to record full, unfiltered history
+        # for the log window's catch-up-on-open.
+        self._full_log_history.append(text)
+
+        # Raw OVMS/llama-server log lines (server.py's print(f"[ovms] launching:
+        # ...") and _drain_subprocess_output's "[ovms] "/"[llama] " prefix) are
+        # noisy and not something you'd want copy-pasted along with a code
+        # block -- they still reach the pop-out Log Window live (via the
+        # separate _append_log_window connection) and in its history, just
+        # not here.
+        if text.startswith("[ovms]") or text.startswith("[llama]"):
+            return
         cursor = self.console.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertText(text)
