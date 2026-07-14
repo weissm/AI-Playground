@@ -178,6 +178,22 @@ def ovms_servable_name(model: str) -> str:
     return model.replace("/", "---")
 
 
+def query_ovms_loaded_model(base_url: str) -> Optional[str]:
+    """Ask an already-running OVMS server what it's actually serving (OVMS
+    only ever has the single --source_model it was launched with). Used to
+    default ov-chat's --model to whatever's really loaded instead of a
+    guessed constant that silently drifts out of sync and 404s."""
+    if requests is None:
+        return None
+    try:
+        resp = requests.get(f"{base_url}/models", timeout=3)
+        resp.raise_for_status()
+        data = resp.json()["data"]
+        return data[0]["id"] if data else None
+    except (requests.exceptions.RequestException, KeyError, IndexError, ValueError):
+        return None
+
+
 def list_ovms_models(model_repository_path: Path) -> list[str]:
     """Model folder names already installed under model_repository_path.
     Each is already sanitized (see ovms_servable_name), so it can be passed
@@ -742,7 +758,12 @@ def build_parser(cfg: dict) -> argparse.ArgumentParser:
     ov_chat = sub.add_parser("ov-chat", help="Send a chat completion to an already-running OVMS server")
     ov_chat.add_argument("--host", default=cfg["server"]["host"])
     ov_chat.add_argument("--port", type=int, default=cfg["server"]["port"])
-    ov_chat.add_argument("--model", default=DEFAULT_OPENVINO_MODEL)
+    ov_chat.add_argument(
+        "--model",
+        default=None,
+        help="Defaults to whatever the running OVMS server actually has loaded "
+        f"(queried via /v3/models), falling back to {DEFAULT_OPENVINO_MODEL} if that fails.",
+    )
     add_generation_args(ov_chat, cfg)
 
     ov_run = sub.add_parser("ov-run", help="Start OVMS, send one prompt, then stop it")
@@ -795,9 +816,19 @@ def main() -> None:
         return
 
     if args.command == "ov-chat":
+        base_url = f"http://{loopback_host(args.host)}:{args.port}/v3"
+        if args.model is not None:
+            model = ovms_servable_name(args.model)
+        else:
+            model = query_ovms_loaded_model(base_url)
+            if model is None:
+                model = ovms_servable_name(DEFAULT_OPENVINO_MODEL)
+            else:
+                print(f"[ov-chat] no --model given; using currently loaded model: {model}")
+
         chat_cfg = ChatRequestConfig(
-            base_url=f"http://{loopback_host(args.host)}:{args.port}/v3",
-            model=ovms_servable_name(args.model),
+            base_url=base_url,
+            model=model,
             system_prompt=args.system_prompt,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
