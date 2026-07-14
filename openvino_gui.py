@@ -33,7 +33,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import re
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -57,6 +60,7 @@ try:
         QPushButton,
         QRadioButton,
         QSpinBox,
+        QSplitter,
         QVBoxLayout,
         QWidget,
     )
@@ -251,6 +255,65 @@ class ChatWorker(QThread):
                 self.finished_err.emit(str(e))
 
 
+_CODE_FENCE_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL)
+
+
+def extract_last_code_block(text: str) -> Optional[str]:
+    """Pull the last fenced code block out of a chat response (assistant
+    replies routinely wrap Python in a ```python ... ``` fence), so the
+    Python console can be pre-filled with whatever the model just wrote."""
+    matches = _CODE_FENCE_RE.findall(text)
+    return matches[-1].strip() if matches else None
+
+
+class PythonRunWorker(QThread):
+    """Runs a code string as a standalone python subprocess (rather than
+    exec()-ing it in-process) so a crash, an infinite loop, or a GUI mainloop
+    (turtle/matplotlib) in the generated code can't take down the app, and
+    can be killed cleanly via terminate()."""
+
+    line_output = Signal(str)
+    finished_run = Signal(int)
+
+    def __init__(self, code: str):
+        super().__init__()
+        self.code = code
+        self.process: Optional[subprocess.Popen] = None
+        self._tmp_path: Optional[Path] = None
+
+    def run(self) -> None:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(self.code)
+            self._tmp_path = Path(f.name)
+
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, str(self._tmp_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                cwd=str(self._tmp_path.parent),
+            )
+            assert self.process.stdout is not None
+            for line in self.process.stdout:
+                self.line_output.emit(line)
+            self.process.wait()
+            self.finished_run.emit(self.process.returncode)
+        except Exception as e:  # noqa: BLE001
+            self.line_output.emit(f"[python] failed to launch: {e}\n")
+            self.finished_run.emit(-1)
+        finally:
+            if self._tmp_path is not None:
+                self._tmp_path.unlink(missing_ok=True)
+
+    def stop(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, cfg: dict):
         super().__init__()
@@ -267,6 +330,13 @@ class MainWindow(QMainWindow):
         self.api_server: Optional[ApiServer] = None
         self.log_window: Optional[QMainWindow] = None
         self._log_window_text_edit: Optional[QPlainTextEdit] = None
+        self.python_window: Optional[QMainWindow] = None
+        self._python_code_edit: Optional[QPlainTextEdit] = None
+        self._python_output_edit: Optional[QPlainTextEdit] = None
+        self._python_run_button: Optional[QPushButton] = None
+        self._python_stop_button: Optional[QPushButton] = None
+        self._python_run_worker: Optional[PythonRunWorker] = None
+        self._last_code_block: Optional[str] = None
 
         self.setWindowTitle("AI Playground - Local LLM Console")
         self.resize(900, 650)
@@ -406,6 +476,9 @@ class MainWindow(QMainWindow):
         self.log_window_button = QPushButton("Open Log Window")
         self.log_window_button.clicked.connect(self._show_log_window)
         console_header_row.addWidget(self.log_window_button)
+        self.python_console_button = QPushButton("Python Console")
+        self.python_console_button.clicked.connect(self._show_python_console)
+        console_header_row.addWidget(self.python_console_button)
         root.addLayout(console_header_row)
 
         self.console = QPlainTextEdit()
@@ -479,6 +552,120 @@ class MainWindow(QMainWindow):
     def _on_log_window_closed(self) -> None:
         self.log_window = None
         self._log_window_text_edit = None
+
+    # ---- Python console --------------------------------------------------
+    def _show_python_console(self) -> None:
+        if self.python_window is not None:
+            self.python_window.show()
+            self.python_window.raise_()
+            self.python_window.activateWindow()
+            return
+
+        self.python_window = QMainWindow(self)
+        self.python_window.setWindowTitle("AI Playground - Python Console")
+        self.python_window.resize(800, 600)
+        self.python_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.python_window.destroyed.connect(self._on_python_window_closed)
+
+        central = QWidget()
+        layout = QVBoxLayout(central)
+
+        toolbar_row = QHBoxLayout()
+        load_button = QPushButton("Load Last Code Block From Chat")
+        load_button.clicked.connect(self._load_last_code_block)
+        toolbar_row.addWidget(load_button)
+        toolbar_row.addStretch(1)
+        self._python_run_button = QPushButton("Run")
+        self._python_run_button.clicked.connect(self._run_python_code)
+        self._python_stop_button = QPushButton("Stop")
+        self._python_stop_button.clicked.connect(self._stop_python_code)
+        self._python_stop_button.setEnabled(False)
+        toolbar_row.addWidget(self._python_run_button)
+        toolbar_row.addWidget(self._python_stop_button)
+        layout.addLayout(toolbar_row)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+
+        code_edit = QPlainTextEdit()
+        code_edit.setFont(QFont("Consolas", 9))
+        code_edit.setPlaceholderText(
+            "# Write or paste Python code here, then click Run.\n"
+            "# Runs as a separate process (python -u <this code>), so it's\n"
+            "# safe to use turtle/matplotlib windows, infinite loops (use Stop\n"
+            "# to kill it), etc. -- it can't crash or freeze this GUI.\n"
+        )
+        if self._last_code_block:
+            code_edit.setPlainText(self._last_code_block)
+        splitter.addWidget(code_edit)
+        self._python_code_edit = code_edit
+
+        output_edit = QPlainTextEdit()
+        output_edit.setReadOnly(True)
+        output_edit.setFont(QFont("Consolas", 9))
+        output_edit.setMaximumBlockCount(20000)
+        splitter.addWidget(output_edit)
+        self._python_output_edit = output_edit
+
+        splitter.setSizes([350, 250])
+        layout.addWidget(splitter, 1)
+
+        self.python_window.setCentralWidget(central)
+        self.python_window.show()
+
+    def _load_last_code_block(self) -> None:
+        if self._python_code_edit is None:
+            return
+        if self._last_code_block:
+            self._python_code_edit.setPlainText(self._last_code_block)
+        else:
+            QMessageBox.information(self, "No code found", "No fenced code block found in the chat yet.")
+
+    def _run_python_code(self) -> None:
+        if self._python_run_worker is not None and self._python_run_worker.isRunning():
+            return
+        if self._python_code_edit is None or self._python_output_edit is None:
+            return
+        code = self._python_code_edit.toPlainText()
+        if not code.strip():
+            return
+
+        self._python_output_edit.clear()
+        self._python_run_button.setEnabled(False)
+        self._python_stop_button.setEnabled(True)
+
+        self._python_run_worker = PythonRunWorker(code)
+        self._python_run_worker.line_output.connect(self._append_python_output)
+        self._python_run_worker.finished_run.connect(self._on_python_finished)
+        self._python_run_worker.start()
+
+    def _stop_python_code(self) -> None:
+        if self._python_run_worker is not None:
+            self._python_run_worker.stop()
+
+    def _append_python_output(self, text: str) -> None:
+        if self._python_output_edit is None:
+            return
+        cursor = self._python_output_edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(text)
+        self._python_output_edit.setTextCursor(cursor)
+        self._python_output_edit.ensureCursorVisible()
+
+    def _on_python_finished(self, exit_code: int) -> None:
+        self._append_python_output(f"\n[python] exited with code {exit_code}\n")
+        if self._python_run_button is not None:
+            self._python_run_button.setEnabled(True)
+        if self._python_stop_button is not None:
+            self._python_stop_button.setEnabled(False)
+
+    def _on_python_window_closed(self) -> None:
+        if self._python_run_worker is not None:
+            self._python_run_worker.stop()
+        self.python_window = None
+        self._python_code_edit = None
+        self._python_output_edit = None
+        self._python_run_button = None
+        self._python_stop_button = None
 
     # ---- helpers ---------------------------------------------------------
     def _append_console(self, text: str) -> None:
@@ -667,6 +854,10 @@ class MainWindow(QMainWindow):
             self._append_console("\n[gui] stopped.\n")
         # Streamed (non-cancelled) output already printed itself (with a
         # trailing newline) live via ovc.chat().
+        if result and not was_cancelled:
+            code_block = extract_last_code_block(result)
+            if code_block:
+                self._last_code_block = code_block
         self.stop_chat_button.setEnabled(False)
         self.prompt_edit.setEnabled(True)
         self.send_button.setEnabled(True)
@@ -689,6 +880,11 @@ class MainWindow(QMainWindow):
         if self.api_server:
             try:
                 self.api_server.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        if self._python_run_worker is not None:
+            try:
+                self._python_run_worker.stop()
             except Exception:  # noqa: BLE001
                 pass
         super().closeEvent(event)
