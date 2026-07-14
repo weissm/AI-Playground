@@ -632,7 +632,14 @@ def chat(
             if line.strip() == "[DONE]":
                 break
             try:
-                delta = json.loads(line)["choices"][0]["delta"].get("content", "")
+                # .get("content", "") only covers a *missing* key -- some
+                # backends (reasoning models in particular) send chunks with
+                # "content" explicitly null (e.g. the initial
+                # {"role": "assistant"} delta), which .get() happily returns
+                # as None. Coerce that to "" too, or print(None) leaks the
+                # literal string "None" into the output and "".join(chunks)
+                # later crashes on a non-str item.
+                delta = json.loads(line)["choices"][0]["delta"].get("content") or ""
             except (KeyError, IndexError, json.JSONDecodeError):
                 continue
             print(delta, end="", flush=True)
